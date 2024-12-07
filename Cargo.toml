@@ -1,0 +1,13 @@
+[package]
+name = "katarl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.94"
+crossbeam-channel = "0.5.13"
+midir = "0.10.1"
+serde = { version = "1.0.215", features = ["serde_derive"] }
+signal-hook = "0.3.17"
+toml = "0.8.19"
+xdg = "2.5.2"
