@@ -4,49 +4,89 @@
 mod conf;
 
 use core::str;
-use std::{ffi::OsStr, process::{Command, ExitStatus}, str::{from_utf8, FromStr}, sync::{atomic::{AtomicBool, Ordering}, mpsc::channel, Arc}, time::Duration};
+use std::{ffi::OsStr, process::{Command, ExitStatus}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, mpsc::channel, Arc}, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use conf::{Exec, Input};
+use log::{debug, info, warn};
 use midir::MidiInput;
+use parse_duration::parse;
 use signal_hook::{consts::TERM_SIGNALS, flag};
 
 #[derive(Clone)]
 enum Action {
-    Exec(String)
+    Exec(Exec)
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+    info!("loading configuration");
     let config = conf::get_config()?;
-
-
-    let mut midi_in = MidiInput::new("katarl")?;
-    midi_in.ignore(midir::Ignore::SysexAndTime);
-
+    info!("found {} configured inputs", config.inputs.len());
+    
     let (tx, rx) = channel();
     let mut connections = Vec::new();
-
+    
     for (idx, input) in config.inputs.into_iter().enumerate() {
-        let mut midi_in = MidiInput::new("katarl")?;
+        info!("initializing MIDI client");
+        let mut midi_in = MidiInput::new(format!("katarl-{}", idx).as_str())?;
         midi_in.ignore(midir::Ignore::SysexAndTime);
 
+        info!("enumerating MIDI ports");
         let ports_and_names = midi_in.ports()
             .into_iter()
             .map(|port| {
                 let port_name = midi_in.port_name(&port)?;
+                debug!("found port {}", port_name);
                 Ok((port_name, port))
             })
             .collect::<Result<Vec<(String, midir::MidiInputPort)>>>()?;
 
+        info!("found {} MIDI ports", ports_and_names.len());
+
         let matching_port = match ports_and_names.into_iter().find(|(name, _)| name.contains(&input.port)) {
-            Some((_, port)) => port,
-            None => continue,
+            Some((name, port)) => {
+                info!("found matching midi port for pattern {}: name = {}, id = {}", input.port, name, port.id());
+                port
+            },
+            None => {
+                warn!("did not find matching MIDI input port for input pattern {}", input.port);
+                continue
+            },
         };
 
         let note = u8::from_str(&input.note)?;
+        let press_duration = match input.hold_time.as_ref() {
+            Some(h) => parse(&h).context(format!("failed to parse hold_time spec: {}", h))?,
+            None => Duration::ZERO,
+        };
         let tx = tx.clone();
-        let connection = midi_in.connect(&matching_port, &format!("katarl-in-{}", idx), move |_, message, _| {
+        let mut input_buffer = None;
+        let connection = midi_in.connect(&matching_port, &format!("katarl-in-{}", idx), move |ts, message, _| {
             match message {
-                [144, n, ..] if *n == note => { let _ = tx.send(Action::Exec(input.exec.clone())); }
+                [128, n, ..] if *n == note && press_duration > Duration::ZERO => {
+                    debug!("detected long press of note {}", n);
+                    match input_buffer.take() {
+                        Some((prev_ts, action)) => {
+                            let observed_duration = ts - prev_ts;
+                            let trigger_duration = press_duration.as_micros() as u64;
+                            if observed_duration > trigger_duration {
+                                debug!("long press of note {} had  observed duration {} > trigger duration {}, command active", n, observed_duration, trigger_duration);
+                                let _ = tx.send(action);
+                            }
+                        },
+                        _ => return,
+                    };
+                },
+                [144, n, ..] if *n == note => {
+                    let action = get_action(&input);
+                    if press_duration == Duration::ZERO {
+                        debug!("detected short press of note {}, command active", n);
+                        let _ = tx.send(action);
+                    } else {
+                        input_buffer = Some((ts, action));
+                    }
+                }
                 _ => return,
             }
         }, ())
@@ -70,27 +110,30 @@ fn main() -> Result<()> {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Err(_) => { continue; },
             Ok(Action::Exec(cmd)) => {
-                let mut split = cmd.split_whitespace();
-                let binary = match split.next() {
-                    Some(p) => p,
+                let cmd = match cmd {
+                    Exec::String(s) => get_command(s.split_whitespace()),
+                    Exec::List(l) => get_command(l.iter().map(|s| s.as_ref())),
+                };
+
+                let output = match cmd {
+                    Some(mut cmd) => {
+                        debug!("executing command: {:?}", cmd);
+                        cmd.output()
+                    },
                     None => continue,
                 };
-                let cmd = Command::new(binary)
-                    .args(split.map(OsStr::new))
-                    .output();
 
-                match cmd {
+                match output {
                     Ok(o) if ExitStatus::success(&o.status) => {
                         if !o.stderr.is_empty() {
-                            
+                            info!("command output: {}", write_output(&o.stdout));
                         }
-                        println!("command output: {}", write_output(&o.stdout));
                     },
                     Ok(o) => {
-                        println!("command failed: {}", write_output(&o.stderr));
+                        info!("command failed: {}", write_output(&o.stderr));
                     }
                     Err(e) => {
-                        println!("failed to execute command: {}", e)
+                        info!("failed to execute command: {}", e)
                     }
                 }
             },
@@ -98,6 +141,21 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn get_action(input: &Input) -> Action {
+    Action::Exec(input.exec.clone())
+}
+
+fn get_command<'a, I>(args: I) -> Option<Command> 
+    where I: IntoIterator<Item = &'a str>
+{
+    let mut iter = args.into_iter();
+    iter.next().map(|p| {
+        let mut cmd = Command::new(p);
+        cmd.args(iter.map(OsStr::new));
+        cmd
+    })
 }
 
 fn write_output(output: &[u8]) -> &str {

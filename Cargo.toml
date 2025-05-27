@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.94"
-crossbeam-channel = "0.5.13"
+env_logger = "0.11.8"
+log = "0.4.27"
 midir = "0.10.1"
+parse_duration = "2.1.1"
 serde = { version = "1.0.215", features = ["serde_derive"] }
 signal-hook = "0.3.17"
 toml = "0.8.19"
